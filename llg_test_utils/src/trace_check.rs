@@ -1,10 +1,24 @@
-use lazy_static::lazy_static;
+/// Trace-based grammar checking.
+///
+/// This module implements the "trace replay" testing strategy: given a grammar
+/// and a recorded sequence of forced / generated tokens, step the parser
+/// forward one mask-compute + commit cycle at a time and verify every
+/// intermediate result.
+///
+/// The main entry point is [`check_grammar`], which is private.  Public
+/// wrappers such as [`check_lark_grammar`] and [`check_lark_grammar_nested`]
+/// construct the appropriate [`TopLevelGrammar`] and delegate here.
 use llguidance::{
     api::{GrammarWithLexer, StopReason, TopLevelGrammar},
-    earley::{SlicedBiasComputer, XorShift},
-    toktrie::{InferenceCapabilities, TokEnv, TokenId},
+    toktrie::{TokEnv, TokenId},
     Constraint, ParserFactory,
 };
+use rand::Rng;
+use serde_json::Value;
+
+use crate::{rng_utils, PARSER_FACTORY};
+
+// ── Core trace engine ────────────────────────────────────────────────────────
 
 /// Check that the grammar generates the expected output.
 ///
@@ -24,7 +38,7 @@ fn check_grammar(
     output: &[&str],
     temp: f32,
 ) -> Constraint {
-    let mut rnd = XorShift::new_str(&serde_json::to_string(&grammar).unwrap());
+    let mut rnd = rng_utils::rng_from_str(&serde_json::to_string(&grammar).unwrap());
 
     let parser = factory.create_parser(grammar).unwrap();
     let can_rollback = parser.parser.grammar().lexer_spec().can_rollback();
@@ -63,15 +77,15 @@ fn check_grammar(
                     break;
                 }
                 let m = m.unwrap();
-                let tok = rnd.sample_from_vob(&m);
+                let tok = rng_utils::sample_from_vob(&mut rnd, &m);
                 let bt = parser2.consume_token(tok).unwrap();
                 assert!(bt == 0);
                 n_tok += 1;
                 if tok == tok_env.tok_trie().eos_token() {
                     break;
                 }
-                if rnd.one_in(10) {
-                    if rnd.one_in(2) {
+                if rnd.random_range(0u32..10) == 0 {
+                    if rnd.random_range(0u32..2) == 0 {
                         let _ = parser2.compute_ff_tokens();
                     }
                     break;
@@ -339,33 +353,7 @@ fn tokenize_trace(tok_env: &TokEnv, s: &str) -> Vec<(bool, TokenId)> {
     result
 }
 
-lazy_static! {
-    static ref PARSER_FACTORY: ParserFactory = {
-        let env =
-            toktrie_hf_downloader::byte_tokenizer_from_name("microsoft/Phi-3.5-mini-instruct")
-            .unwrap()
-            .into_tok_env(Some(35000))
-            .unwrap();
-        let mut fact = ParserFactory::new(&env,
-            InferenceCapabilities {
-                ff_tokens: true, // can the engine append multiple tokens?
-                backtrack: true, // can the engine remove generated tokens?
-                conditional_ff_tokens: false, // not used
-                fork: false,                  // not used
-            }, &SlicedBiasComputer::general_slices()).unwrap();
-        fact.set_stderr_log_level(2);
-        fact.set_buffer_log_level(0);
-        fact
-    };
-}
-
-pub fn get_tok_env() -> &'static TokEnv {
-    PARSER_FACTORY.tok_env()
-}
-
-pub fn get_parser_factory() -> &'static ParserFactory {
-    &PARSER_FACTORY
-}
+// ── Public lark / JSON wrappers ──────────────────────────────────────────────
 
 pub fn check_lark_grammar_prompt(lark: &str, prompt_str: &str, output: &[&str]) -> Constraint {
     let grm = TopLevelGrammar::from_lark(lark.to_string());
@@ -417,7 +405,7 @@ pub fn check_lark_grammar_nested(lark: &str, sub_lark: &str, output: &[&str]) ->
     r
 }
 
-pub fn check_lark_json(lark: &str, json_schema: serde_json::Value, output: &[&str]) -> Constraint {
+pub fn check_lark_json(lark: &str, json_schema: Value, output: &[&str]) -> Constraint {
     let temp = find_temperature(lark);
     let schema_str = serde_json::to_string_pretty(&json_schema).unwrap();
     let mut top_grm = TopLevelGrammar::from_lark(lark.to_string());

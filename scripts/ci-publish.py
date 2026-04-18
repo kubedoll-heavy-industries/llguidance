@@ -19,18 +19,38 @@ def get_toktrie_version():
 
 
 def update_dependency(crate, version):
-    """Replaces `workspace = true` dependency in Cargo.toml with actual version."""
+    """Replaces workspace refs in [dependencies] with a version for publishing.
+
+    Only rewrites ``{ workspace = true }`` lines within the [dependencies]
+    section.  Lines in [dev-dependencies] (and other sections) are left
+    untouched so that ``cargo publish`` correctly strips path-only
+    dev-dependencies.
+
+    We use simple line-by-line section tracking rather than a TOML library
+    because tomllib (stdlib) is read-only, and we want to avoid adding a
+    third-party dependency just for this script.
+    """
     cargo_toml_path = os.path.join(crate, "Cargo.toml")
     with open(cargo_toml_path, "r") as f:
-        content = f.read()
+        lines = f.readlines()
 
-    updated_content = re.sub(r'\{ workspace = true \}',
-                             f'{{ version = "{version}" }}', content)
+    in_dependencies = False
+    workspace_re = re.compile(r"^(\S+)\s*=\s*\{ workspace = true \}")
+    updated_lines = []
+    for line in lines:
+        if line.strip().startswith("["):
+            in_dependencies = line.strip() == "[dependencies]"
+        if in_dependencies:
+            m = workspace_re.match(line)
+            if m:
+                dep_name = m.group(1)
+                line = f'{dep_name} = {{ version = "{version}" }}\n'
+        updated_lines.append(line)
 
     with open(cargo_toml_path, "w") as f:
-        f.write(updated_content)
+        f.writelines(updated_lines)
 
-    return content  # Return original content for restoration
+    return "".join(lines)  # Return original content for restoration
 
 
 def restore_dependency(crate, original_content):
@@ -42,9 +62,7 @@ def restore_dependency(crate, original_content):
 
 def publish_crate(crate):
     """Runs `cargo publish` in the specified crate directory."""
-    subprocess.run(["cargo", "publish", "--allow-dirty"],
-                   cwd=crate,
-                   check=True)
+    subprocess.run(["cargo", "publish", "--allow-dirty"], cwd=crate, check=True)
 
 
 def main():
@@ -55,10 +73,7 @@ def main():
     publish_crate("toktrie")
 
     # Publish dependent crates
-    for crate in [
-            "toktrie_hf_tokenizers", "toktrie_hf_downloader",
-            "toktrie_tiktoken", "parser"
-    ]:
+    for crate in ["toktrie_hf_tokenizers", "toktrie_hf_downloader", "toktrie_tiktoken", "parser"]:
         print(f"Updating {crate} to use toktrie v{toktrie_version}...")
         original_content = update_dependency(crate, toktrie_version)
 

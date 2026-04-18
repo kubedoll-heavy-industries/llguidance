@@ -1,8 +1,8 @@
-use llguidance::{earley::XorShift, substring::chunk_into_words};
+use llguidance::substring::chunk_into_words;
+use rand::{rngs::SmallRng, Rng, SeedableRng};
 use serde_json::json;
 
-mod common_lark_utils;
-use common_lark_utils::*;
+use llg_test_utils::*;
 
 #[test]
 fn test_dot_unicode() {
@@ -460,14 +460,14 @@ fn test_lexeme_substring_words_unicode() {
 
 fn gen_words(seed: u32, num_words: usize) -> String {
     let letters = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789,.";
-    let mut rnd = XorShift::new(seed + 1);
+    let mut rnd = SmallRng::seed_from_u64((seed + 1) as u64);
     let mut words = vec![];
-    let num_words = rnd.from_range((num_words / 2)..num_words);
+    let num_words = rnd.random_range((num_words / 2)..num_words);
     for _ in 0..num_words {
         let mut word = String::new();
-        let len = rnd.from_range(1..15);
+        let len = rnd.random_range(1..15);
         for _ in 0..len {
-            let idx = rnd.from_range(0..letters.len());
+            let idx = rnd.random_range(0..letters.len());
             word.push(letters.as_bytes()[idx] as char);
         }
         words.push(word);
@@ -719,7 +719,7 @@ fn test_nested_lark() {
 
 #[test]
 fn test_large_real_substring() {
-    let data = include_str!("../data/ulysses.md");
+    let data = include_str!("data/ulysses.md");
     // 240k is the limit for 1M fuel
     let data = data[..200_000].to_string();
     let grm = format!(
@@ -800,6 +800,9 @@ fn test_json_pattern_properties() {
         "required property 'foo' is unsatisfiable",
     );
 
+    // "foo" matches patternProperties "^foo" (type: integer), but properties says
+    // type: string. Per JSON Schema spec, both must be satisfied — string ∩ integer
+    // is unsatisfiable. Since "foo" is optional, objects without "foo" are still valid.
     json_test_many(
         &json!({
             "type": "object",
@@ -817,10 +820,6 @@ fn test_json_pattern_properties() {
         &[
             json!({}),
             json!({
-                "foo": "bar"
-            }),
-            json!({
-                "foo": "bar",
                 "foo1": 123,
                 "bar": [],
                 "qux": true,
@@ -837,6 +836,9 @@ fn test_json_pattern_properties() {
         ],
         &[
             json!({
+                "foo": "bar"
+            }),
+            json!({
                 "foo": 123
             }),
             json!({
@@ -851,7 +853,34 @@ fn test_json_pattern_properties() {
         ],
     );
 
+    // "count" matches both properties (integer, minimum: 0) and patternProperties
+    // "^c" (integer, multipleOf: 5). The intersection produces non-negative multiples of 5.
     json_test_many(
+        &json!({
+            "type": "object",
+            "properties": {
+                "count": { "type": "integer", "minimum": 0 },
+            },
+            "patternProperties": {
+                "^c": { "type": "integer", "multipleOf": 5 },
+            },
+            "required": ["count"],
+        }),
+        &[
+            json!({"count": 0}),
+            json!({"count": 10}),
+            json!({"count": 25}),
+        ],
+        &[
+            json!({"count": 3}),
+            json!({"count": 7}),
+            json!({"count": -5}),
+        ],
+    );
+
+    // "foo" is required but matches both properties (string) and patternProperties
+    // "^foo" (integer) — the intersection is unsatisfiable, so the schema errors.
+    json_err_test(
         &json!({
             "type": "object",
             "properties": {
@@ -866,15 +895,36 @@ fn test_json_pattern_properties() {
             },
             "required": ["foo", "mux", "foo1", "bar1"],
         }),
+        "required property 'foo' is unsatisfiable",
+    );
+
+    // "name" doesn't match any pattern, so properties + patternProperties +
+    // additionalProperties all coexist. Tests required property ordering and
+    // type enforcement across all three keyword types.
+    json_test_many(
+        &json!({
+            "type": "object",
+            "properties": {
+                "name": { "type": "string" },
+            },
+            "patternProperties": {
+                "^foo": { "type": "integer" },
+                "^bar": { "type": "array" },
+            },
+            "additionalProperties": {
+                "type": "boolean",
+            },
+            "required": ["name", "mux", "foo1", "bar1"],
+        }),
         &[
             json!({
-                "foo": "bar",
+                "name": "hello",
                 "mux": false,
                 "foo1": 123,
                 "bar1": [],
             }),
             json!({
-                "foo": "bar",
+                "name": "hello",
                 "mux": false,
                 "foo1": 123,
                 "bar1": [],
@@ -882,25 +932,105 @@ fn test_json_pattern_properties() {
             }),
         ],
         &[
+            // wrong order
             json!({
-                "foo": "bar",
+                "name": "hello",
                 "mux": false,
                 "bar1": [],
                 "foo1": 123,
             }),
+            // mux wrong type (must be boolean via additionalProperties)
             json!({
-                "foo": "bar",
+                "name": "hello",
                 "mux": "blah",
                 "foo1": 123,
                 "bar1": [],
             }),
+            // foo1 wrong type (must be integer via ^foo pattern)
             json!({
-                "foo": "bar",
+                "name": "hello",
                 "mux": false,
                 "foo1": "aaa",
                 "bar1": [],
             }),
         ],
+    );
+
+    // allOf: one schema has additionalProperties: false (no properties/patterns),
+    // the other has patternProperties. Since the first schema rejects all properties,
+    // the pattern becomes unsatisfiable for any matching property.
+    json_test_many(
+        &json!({
+            "allOf": [
+                { "additionalProperties": false },
+                { "patternProperties": { "^f": { "type": "integer" } } },
+            ],
+        }),
+        &[json!({})],
+        &[
+            json!({"foo": 42}),
+            json!({"bar": 1}),
+            json!({"foo": 42, "bar": 1}),
+        ],
+    );
+
+    // allOf: one schema allows only "foo" (additionalProperties: false), the other
+    // has patternProperties "^f". Only "foo" survives (it's a named property in the
+    // first schema), while other "^f" matches like "fxx" are rejected.
+    json_test_many(
+        &json!({
+            "allOf": [
+                {
+                    "properties": { "foo": { "type": "string" } },
+                    "additionalProperties": false,
+                },
+                {
+                    "patternProperties": { "^f": { "type": "string" } },
+                },
+            ],
+        }),
+        &[json!({}), json!({"foo": "bar"})],
+        &[json!({"foo": 42}), json!({"fxx": "bar"})],
+    );
+
+    // allOf: both schemas have the same pattern key "^f". The pattern schemas
+    // are intersected: integer ∩ multipleOf(3) = integers that are multiples of 3.
+    json_test_many(
+        &json!({
+            "allOf": [
+                { "patternProperties": { "^f": { "type": "integer", "minimum": 0 } } },
+                { "patternProperties": { "^f": { "type": "integer", "multipleOf": 3 } } },
+            ],
+        }),
+        &[
+            json!({}),
+            json!({"foo": 0}),
+            json!({"fox": 9}),
+            json!({"foo": 3, "fox": 6}),
+        ],
+        &[
+            json!({"foo": 1}),
+            json!({"foo": -3}),
+            json!({"foo": 3, "fox": 5}),
+        ],
+    );
+
+    // allOf: different pattern keys from each schema. Both patterns must
+    // coexist (and be disjoint).
+    json_test_many(
+        &json!({
+            "allOf": [
+                { "patternProperties": { "^f": { "type": "integer" } } },
+                { "patternProperties": { "^b": { "type": "string" } } },
+            ],
+        }),
+        &[
+            json!({}),
+            json!({"foo": 42}),
+            json!({"bar": "hello"}),
+            json!({"foo": 1, "bar": "x"}),
+        ],
+        &[json!({"foo": "nope"}), json!({"bar": 42})],
     );
 }
 
